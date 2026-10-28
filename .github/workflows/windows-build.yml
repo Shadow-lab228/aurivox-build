@@ -1,0 +1,180 @@
+name: Windows build (builder)
+
+# This workflow is Aurivox's Windows build path (SPEC §14): the dev
+# environment is Linux, so Windows binaries are produced and verified
+# here, on GitHub's windows-latest runners.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  frontend:
+    name: Frontend (type-check + bundle)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Shadow-lab228/aurivox
+          token: ${{ secrets.AURIVOX_SOURCE_TOKEN }}
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  windows:
+    name: Windows app (Rust + Tauri bundle)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Shadow-lab228/aurivox
+          token: ${{ secrets.AURIVOX_SOURCE_TOKEN }}
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      # sherpa-onnx-sys links prebuilt static libs. Its build script
+      # downloads them into the (cached) target dir and skips the
+      # download whenever a cache folder already exists — a stale or
+      # partial rust-cache restore therefore links against nothing
+      # ("could not find native static library sherpa-onnx-c-api").
+      # Fetch the exact archive ourselves and point the crate at it
+      # via SHERPA_ONNX_LIB_DIR, which its build script checks first.
+      - name: Fetch sherpa-onnx prebuilt libs (win-x64, static)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stem = 'sherpa-onnx-v2.0.1-win-x64-static-MT-Release-lib'
+          $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/$stem.tar.bz2"
+          $dest = Join-Path $env:RUNNER_TEMP 'sherpa-onnx-prebuilt'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          $archive = Join-Path $dest "$stem.tar.bz2"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          tar -xjf $archive -C $dest
+          $libDir = Join-Path $dest "$stem\lib"
+          if (-not (Test-Path (Join-Path $libDir 'sherpa-onnx-c-api.lib'))) {
+            throw "sherpa-onnx-c-api.lib missing after extract at $libDir"
+          }
+          "SHERPA_ONNX_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "SHERPA_ONNX_LIB_DIR=$libDir"
+
+      # ── Runtime sidecars (SPEC §14) ─────────────────────────────
+      # The app shells out to whisper-cli + ffmpeg + ffprobe, and all
+      # three ship inside the installers as Tauri externalBin
+      # sidecars. tauri-build validates externalBin existence at
+      # compile time, so the files must be in src-tauri\binaries
+      # BEFORE cargo test / tauri build run.
+
+      # ffmpeg/ffprobe: pinned BtbN autobuild (tag
+      # autobuild-2026-10-27-18-38), LGPL *static* build of the
+      # FFmpeg 8.1 branch. We only decode common formats and encode
+      # 16 kHz mono WAV — all LGPL-covered functionality — so the
+      # LGPL (not GPL) variant keeps redistribution clean; static
+      # means each exe is self-contained, no DLLs to ship alongside.
+      - name: Fetch ffmpeg/ffprobe sidecars (BtbN, LGPL, pinned)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stem = 'ffmpeg-n8.1.3-24-g92611900bb-win64-lgpl-8.1'
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-27-18-38/$stem.zip"
+          $dest = Join-Path $env:RUNNER_TEMP 'ffmpeg-sidecar'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          $zip = Join-Path $dest "$stem.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          tar -xf $zip -C $dest
+          $binDir = Join-Path $dest "$stem\bin"
+          $sidecarDir = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\binaries'
+          New-Item -ItemType Directory -Force $sidecarDir | Out-Null
+          Copy-Item (Join-Path $binDir 'ffmpeg.exe') (Join-Path $sidecarDir 'ffmpeg-x86_64-pc-windows-msvc.exe')
+          Copy-Item (Join-Path $binDir 'ffprobe.exe') (Join-Path $sidecarDir 'ffprobe-x86_64-pc-windows-msvc.exe')
+          foreach ($name in 'ffmpeg-x86_64-pc-windows-msvc.exe', 'ffprobe-x86_64-pc-windows-msvc.exe') {
+            if (-not (Test-Path (Join-Path $sidecarDir $name))) {
+              throw "ffmpeg sidecar missing after copy: $name"
+            }
+          }
+          Write-Host 'ffmpeg/ffprobe sidecars in place.'
+
+      # whisper-cli: built from source — ggml-org/whisper.cpp
+      # v1.9.5, the nearest release tag to the dev snapshot the
+      # Phase 2 spikes validated (1.9.5-dev @ 21ba6d26, 135 commits
+      # past the v1.9.5 tag). BUILD_SHARED_LIBS=OFF + static CRT →
+      # one self-contained whisper-cli.exe (ggml linked in, no DLL
+      # dependencies beyond Windows itself).
+      - name: Build whisper-cli sidecar (whisper.cpp v1.9.5, static)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:RUNNER_TEMP 'whisper.cpp'
+          git clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp.git $src
+          cmake -S $src -B (Join-Path $src 'build') -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_SDL2=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build (Join-Path $src 'build') --config Release -j
+          $exe = Get-ChildItem -Path (Join-Path $src 'build') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1
+          if (-not $exe) {
+            throw 'whisper-cli.exe missing after build'
+          }
+          $sidecarDir = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\binaries'
+          New-Item -ItemType Directory -Force $sidecarDir | Out-Null
+          $target = Join-Path $sidecarDir 'whisper-cli-x86_64-pc-windows-msvc.exe'
+          Copy-Item $exe.FullName $target
+          if (-not (Test-Path $target)) {
+            throw "whisper-cli sidecar missing after copy: $target"
+          }
+          Write-Host "whisper-cli sidecar in place: $($exe.FullName)"
+
+      - name: Rust unit tests (credits, recommendation rules, manifest)
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Tauri app (MSI + NSIS)
+        run: npx tauri build
+
+      # ── MSIX packaging (Phase 8 machinery, Phase 9 identity) ────
+      # Pack the release output with makeappx using the REAL Partner
+      # Center identity (defaults in packaging/make-msix.ps1; Aurivox
+      # reserved 2026-10-28, SPEC §14/§15). Strict on purpose: if
+      # this step breaks, the job fails, so a green run proves the
+      # whole packaging path (layout staging, manifest substitution,
+      # makeappx) end to end. The package is unsigned; the Store
+      # signs at certification.
+      - name: Pack MSIX (real Partner Center identity)
+        shell: pwsh
+        run: ./packaging/make-msix.ps1 -OutFile (Join-Path $env:GITHUB_WORKSPACE 'aurivox.msix')
+
+      - name: Upload MSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: aurivox-msix-${{ github.sha }}
+          path: aurivox.msix
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: aurivox-windows-${{ github.sha }}
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
