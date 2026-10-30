@@ -276,6 +276,15 @@ jobs:
             throw 'control failed: the FAST engine ran clean under the pre-AVX profile — this proof cannot distinguish the builds; investigate before shipping'
           }
           Write-Host 'compat proof passed: compat transcribes on a Pentium-4-class CPU; the fast build provably cannot.'
+          # Both checks passed. The fast control run above exits
+          # non-zero BY DESIGN, so $LASTEXITCODE is still non-zero
+          # here — and the GitHub Actions pwsh wrapper propagates
+          # the script's final $LASTEXITCODE as the step's exit
+          # code (run #11, SPEC §19.13: this step printed the pass
+          # line above, then failed with exit code 1). End the
+          # step explicitly green; every genuine failure throws
+          # before this line.
+          exit 0
 
       - name: Rust unit tests (credits, recommendation rules, manifest)
         run: cargo test --manifest-path src-tauri/Cargo.toml
