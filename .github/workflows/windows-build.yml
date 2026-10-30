@@ -123,46 +123,18 @@ jobs:
       # one self-contained whisper-cli.exe (ggml linked in, no DLL
       # dependencies beyond Windows itself).
       #
-      # TWO builds ship (v1.1.1, SPEC §19): the fast build above and
-      # a compat build with every post-baseline CPU feature off, for
-      # processors without AVX2 (the 1.1.0 Acer field failure:
-      # whisper died with 0xC000001D STATUS_ILLEGAL_INSTRUCTION).
-      # BMI2 and SSE4.2 are on the off list on purpose — BMI2's
-      # VEX-encoded shifts crash pre-Haswell CPUs exactly like AVX
-      # does (the first compat attempt proved it under Intel SDE),
-      # and the proof steps below gate on a Pentium-4-class profile.
+      # TWO builds ship (v1.1.1, SPEC §19): fast, and a compat build
+      # with every post-baseline CPU feature off, for processors
+      # without AVX2 (the 1.1.0 Acer field failure: whisper died
+      # with 0xC000001D STATUS_ILLEGAL_INSTRUCTION). The recipes live
+      # in the source repo (packaging/build-whisper.ps1) so they can
+      # be fixed through the normal sync path instead of by editing
+      # this workflow; SPEC §19.8 explains why the compat recipe also
+      # links baseline CRT memory routines. The proof steps below
+      # gate the result.
       - name: Build whisper-cli sidecars (whisper.cpp v1.9.5, fast + compat)
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $src = Join-Path $env:RUNNER_TEMP 'whisper.cpp'
-          git clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp.git $src
-          cmake -S $src -B (Join-Path $src 'build') -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_SDL2=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
-          cmake --build (Join-Path $src 'build') --config Release -j
-          $exe = Get-ChildItem -Path (Join-Path $src 'build') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1
-          if (-not $exe) {
-            throw 'whisper-cli.exe missing after build'
-          }
-          $sidecarDir = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\binaries'
-          New-Item -ItemType Directory -Force $sidecarDir | Out-Null
-          $target = Join-Path $sidecarDir 'whisper-cli-x86_64-pc-windows-msvc.exe'
-          Copy-Item $exe.FullName $target
-          if (-not (Test-Path $target)) {
-            throw "whisper-cli sidecar missing after copy: $target"
-          }
-          Write-Host "whisper-cli (fast) sidecar in place: $($exe.FullName)"
-          cmake -S $src -B (Join-Path $src 'build-compat') -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_SDL2=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_BMI2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_SSE42=OFF
-          cmake --build (Join-Path $src 'build-compat') --config Release -j
-          $compatExe = Get-ChildItem -Path (Join-Path $src 'build-compat') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1
-          if (-not $compatExe) {
-            throw 'whisper-cli.exe missing after compat build'
-          }
-          $compatTarget = Join-Path $sidecarDir 'whisper-cli-compat-x86_64-pc-windows-msvc.exe'
-          Copy-Item $compatExe.FullName $compatTarget
-          if (-not (Test-Path $compatTarget)) {
-            throw "whisper-cli-compat sidecar missing after copy: $compatTarget"
-          }
-          Write-Host "whisper-cli (compat) sidecar in place: $($compatExe.FullName)"
+        run: ./packaging/build-whisper.ps1 -Variant all
 
       # ── Engine proof (v1.1.1, RELEASE_QA.md gate) ─────────────
       # The compat engine is PROVEN, not just built — two checks on
@@ -182,16 +154,30 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # The report directory is created FIRST, so the upload step
+          # below (if: always()) has evidence to publish even when a
+          # check in this step throws.
+          $reportDir = Join-Path $env:RUNNER_TEMP 'engine-audit'
+          New-Item -ItemType Directory -Force $reportDir | Out-Null
+          $report = Join-Path $reportDir 'engine-audit-report.txt'
+          function Log([string]$Line) {
+            Write-Host $Line
+            $Line | Out-File -FilePath $report -Append -Encoding utf8
+          }
+          Log "Aurivox engine audit - run ${{ github.run_id }}, sha ${{ github.sha }}, $(Get-Date -Format o)"
           $objdump = (Get-Command 'llvm-objdump.exe' -ErrorAction SilentlyContinue).Source
           if (-not $objdump -and (Test-Path 'C:\Program Files\LLVM\bin\llvm-objdump.exe')) {
             $objdump = 'C:\Program Files\LLVM\bin\llvm-objdump.exe'
           }
           if (-not $objdump) {
+            Log 'llvm-objdump not found - the audit cannot run'
             throw 'llvm-objdump not found — the instruction audit is a release gate (RELEASE_QA.md) and must not be skipped'
           }
-          $src = Join-Path $env:RUNNER_TEMP 'whisper.cpp'
-          $fastExe = (Get-ChildItem -Path (Join-Path $src 'build') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1).FullName
-          $compatExe = (Get-ChildItem -Path (Join-Path $src 'build-compat') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1).FullName
+          $sidecarDir = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\binaries'
+          $fastExe = Join-Path $sidecarDir 'whisper-cli-x86_64-pc-windows-msvc.exe'
+          $compatExe = Join-Path $sidecarDir 'whisper-cli-compat-x86_64-pc-windows-msvc.exe'
+          Log "fast:   $fastExe"
+          Log "compat: $compatExe"
           function Count-Vex([string]$Exe) {
             $count = 0
             & $objdump -d $Exe | ForEach-Object {
@@ -201,13 +187,78 @@ jobs:
           }
           $fastCount = Count-Vex $fastExe
           $compatCount = Count-Vex $compatExe
-          Write-Host "VEX/EVEX-prefixed instructions: fast=$fastCount compat=$compatCount"
+          Log "VEX/EVEX-prefixed instructions: fast=$fastCount compat=$compatCount"
+          $auditProblems = @()
           if ($fastCount -eq 0) {
-            throw 'audit invalid: the fast engine shows no VEX instructions — the scan is not seeing the code'
+            $auditProblems += 'audit invalid: the fast engine shows no VEX instructions — the scan is not seeing the code'
           }
           if ($compatCount -ne 0) {
-            throw "compat engine contains $compatCount VEX/EVEX-prefixed instructions — NOT safe for pre-AVX CPUs"
+            $auditProblems += "compat engine contains $compatCount VEX/EVEX-prefixed instructions — NOT safe for pre-AVX CPUs"
           }
+          if ($auditProblems.Count -gt 0) {
+            # Fail diagnosably (SPEC §19.8): cluster the offending
+            # instructions by the nearest preceding symbol in the
+            # disassembly, so the report names WHERE the VEX code
+            # lives (which library / object / function), not just
+            # how much of it there is.
+            Log '--- compat VEX cluster analysis (nearest preceding symbol) ---'
+            $clusters = @{}
+            $samples = @{}
+            $section = '(unknown section)'
+            $symbol = '(no symbol)'
+            & $objdump -d $compatExe | ForEach-Object {
+              if ($_ -match '^Disassembly of section (\S+):') {
+                $section = $Matches[1]
+              } elseif ($_ -match '^[0-9a-f]+ <(.+)>:') {
+                $symbol = $Matches[1]
+              } elseif ($_ -match '^\s*([0-9a-f]+):\s+(c4|c5|62)\s') {
+                $key = "$section $symbol"
+                if (-not $clusters.ContainsKey($key)) {
+                  $clusters[$key] = 0
+                  $samples[$key] = @()
+                }
+                $clusters[$key] = $clusters[$key] + 1
+                if ($samples[$key].Count -lt 3) {
+                  $samples[$key] += $_.Trim()
+                }
+              }
+            }
+            foreach ($key in ($clusters.Keys | Sort-Object { $clusters[$_] } -Descending)) {
+              Log ("{0,8}  {1}" -f $clusters[$key], $key)
+              foreach ($s in $samples[$key]) {
+                Log "           $s"
+              }
+            }
+            & $objdump -t $compatExe | Out-File -FilePath (Join-Path $reportDir 'compat-symbol-table.txt') -Encoding utf8
+            Log 'full compat symbol table saved as compat-symbol-table.txt in this artifact'
+            foreach ($problem in $auditProblems) {
+              Log "FAIL: $problem"
+            }
+            throw ($auditProblems -join '; ')
+          }
+          Log 'audit passed: compat contains no VEX/EVEX instructions; fast control is non-zero.'
+
+      # The audit report is evidence, not just a gate: publish it on
+      # every run (pass or fail) so a regression can be diagnosed
+      # from artifacts alone. On any failure, also publish the compat
+      # binary itself for offline analysis (SPEC §19.8).
+      - name: Upload engine audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-audit-report-${{ github.sha }}
+          path: ${{ runner.temp }}/engine-audit
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload compat engine binary (on failure, for offline analysis)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-cli-compat-failed-${{ github.sha }}
+          path: src-tauri/binaries/whisper-cli-compat-x86_64-pc-windows-msvc.exe
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Prove compat engine under a pre-AVX CPU (Intel SDE, Pentium 4 profile)
         shell: pwsh
@@ -225,10 +276,14 @@ jobs:
           if (-not $sde) {
             throw 'sde executable missing after extract'
           }
-          $src = Join-Path $env:RUNNER_TEMP 'whisper.cpp'
-          $fastExe = (Get-ChildItem -Path (Join-Path $src 'build') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1).FullName
-          $compatExe = (Get-ChildItem -Path (Join-Path $src 'build-compat') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1).FullName
-          $model = Join-Path $src 'models\for-tests-ggml-tiny.bin'
+          $sidecarDir = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\binaries'
+          $fastExe = Join-Path $sidecarDir 'whisper-cli-x86_64-pc-windows-msvc.exe'
+          $compatExe = Join-Path $sidecarDir 'whisper-cli-compat-x86_64-pc-windows-msvc.exe'
+          $srcRoot = $env:AURIVOX_WHISPER_SRC
+          if (-not $srcRoot) {
+            $srcRoot = Join-Path $env:RUNNER_TEMP 'aurivox-whisper-build\src'
+          }
+          $model = Join-Path $srcRoot 'models\for-tests-ggml-tiny.bin'
           $clip = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\resources\benchmark\clip.wav'
           Write-Host 'compat engine under SDE -p4p (Pentium 4 Prescott: no AVX/BMI2/SSE4.2)...'
           & $sde.FullName -p4p -- $compatExe -m $model -f $clip -t 2
