@@ -122,7 +122,16 @@ jobs:
       # past the v1.9.5 tag). BUILD_SHARED_LIBS=OFF + static CRT →
       # one self-contained whisper-cli.exe (ggml linked in, no DLL
       # dependencies beyond Windows itself).
-      - name: Build whisper-cli sidecar (whisper.cpp v1.9.5, static)
+      #
+      # TWO builds ship (v1.1.1, SPEC §19): the fast build above and
+      # a compat build with every post-baseline CPU feature off, for
+      # processors without AVX2 (the 1.1.0 Acer field failure:
+      # whisper died with 0xC000001D STATUS_ILLEGAL_INSTRUCTION).
+      # BMI2 and SSE4.2 are on the off list on purpose — BMI2's
+      # VEX-encoded shifts crash pre-Haswell CPUs exactly like AVX
+      # does (the first compat attempt proved it under Intel SDE),
+      # and the proof steps below gate on a Pentium-4-class profile.
+      - name: Build whisper-cli sidecars (whisper.cpp v1.9.5, fast + compat)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -141,7 +150,97 @@ jobs:
           if (-not (Test-Path $target)) {
             throw "whisper-cli sidecar missing after copy: $target"
           }
-          Write-Host "whisper-cli sidecar in place: $($exe.FullName)"
+          Write-Host "whisper-cli (fast) sidecar in place: $($exe.FullName)"
+          cmake -S $src -B (Join-Path $src 'build-compat') -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_SDL2=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_BMI2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_SSE42=OFF
+          cmake --build (Join-Path $src 'build-compat') --config Release -j
+          $compatExe = Get-ChildItem -Path (Join-Path $src 'build-compat') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1
+          if (-not $compatExe) {
+            throw 'whisper-cli.exe missing after compat build'
+          }
+          $compatTarget = Join-Path $sidecarDir 'whisper-cli-compat-x86_64-pc-windows-msvc.exe'
+          Copy-Item $compatExe.FullName $compatTarget
+          if (-not (Test-Path $compatTarget)) {
+            throw "whisper-cli-compat sidecar missing after copy: $compatTarget"
+          }
+          Write-Host "whisper-cli (compat) sidecar in place: $($compatExe.FullName)"
+
+      # ── Engine proof (v1.1.1, RELEASE_QA.md gate) ─────────────
+      # The compat engine is PROVEN, not just built — two checks on
+      # the actual Windows binaries, failing the build loudly:
+      # 1. static audit: zero VEX/EVEX-prefixed instructions in the
+      #    compat binary (first encoding byte c4/c5/62 — in 64-bit
+      #    mode those are VEX/EVEX-only), and a non-zero count in
+      #    the fast binary (a zero there would mean the scan is
+      #    blind and the proof is void);
+      # 2. emulated run: the compat binary transcribes the bundled
+      #    benchmark clip under Intel SDE pinned to a Pentium 4
+      #    Prescott profile (pre-AVX, pre-BMI2, pre-SSE4.2), while
+      #    the fast binary MUST fail the same run — if it passes,
+      #    the harness cannot distinguish the builds and the proof
+      #    is void.
+      - name: Audit whisper engines (compat must contain no VEX/EVEX instructions)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $objdump = (Get-Command 'llvm-objdump.exe' -ErrorAction SilentlyContinue).Source
+          if (-not $objdump -and (Test-Path 'C:\Program Files\LLVM\bin\llvm-objdump.exe')) {
+            $objdump = 'C:\Program Files\LLVM\bin\llvm-objdump.exe'
+          }
+          if (-not $objdump) {
+            throw 'llvm-objdump not found — the instruction audit is a release gate (RELEASE_QA.md) and must not be skipped'
+          }
+          $src = Join-Path $env:RUNNER_TEMP 'whisper.cpp'
+          $fastExe = (Get-ChildItem -Path (Join-Path $src 'build') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1).FullName
+          $compatExe = (Get-ChildItem -Path (Join-Path $src 'build-compat') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1).FullName
+          function Count-Vex([string]$Exe) {
+            $count = 0
+            & $objdump -d $Exe | ForEach-Object {
+              if ($_ -match '^\s*[0-9a-f]+:\s+(c4|c5|62)\s') { $count++ }
+            }
+            return $count
+          }
+          $fastCount = Count-Vex $fastExe
+          $compatCount = Count-Vex $compatExe
+          Write-Host "VEX/EVEX-prefixed instructions: fast=$fastCount compat=$compatCount"
+          if ($fastCount -eq 0) {
+            throw 'audit invalid: the fast engine shows no VEX instructions — the scan is not seeing the code'
+          }
+          if ($compatCount -ne 0) {
+            throw "compat engine contains $compatCount VEX/EVEX-prefixed instructions — NOT safe for pre-AVX CPUs"
+          }
+
+      - name: Prove compat engine under a pre-AVX CPU (Intel SDE, Pentium 4 profile)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdeDir = Join-Path $env:RUNNER_TEMP 'sde'
+          New-Item -ItemType Directory -Force $sdeDir | Out-Null
+          $sdeTar = Join-Path $sdeDir 'sde.tar.xz'
+          Invoke-WebRequest -Uri 'https://downloadmirror.intel.com/859732/sde-external-9.58.0-2025-06-16-win.tar.xz' -OutFile $sdeTar
+          tar -xf $sdeTar -C $sdeDir
+          $sde = Get-ChildItem -Path $sdeDir -Recurse -Filter 'sde64.exe' | Select-Object -First 1
+          if (-not $sde) {
+            $sde = Get-ChildItem -Path $sdeDir -Recurse -Filter 'sde.exe' | Select-Object -First 1
+          }
+          if (-not $sde) {
+            throw 'sde executable missing after extract'
+          }
+          $src = Join-Path $env:RUNNER_TEMP 'whisper.cpp'
+          $fastExe = (Get-ChildItem -Path (Join-Path $src 'build') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1).FullName
+          $compatExe = (Get-ChildItem -Path (Join-Path $src 'build-compat') -Recurse -Filter 'whisper-cli.exe' | Select-Object -First 1).FullName
+          $model = Join-Path $src 'models\for-tests-ggml-tiny.bin'
+          $clip = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\resources\benchmark\clip.wav'
+          Write-Host 'compat engine under SDE -p4p (Pentium 4 Prescott: no AVX/BMI2/SSE4.2)...'
+          & $sde.FullName -p4p -- $compatExe -m $model -f $clip -t 2
+          if ($LASTEXITCODE -ne 0) {
+            throw "compat engine FAILED under the pre-AVX SDE profile (exit $LASTEXITCODE) — it still touches a post-baseline instruction"
+          }
+          Write-Host 'fast engine under the same profile (control — must fail)...'
+          & $sde.FullName -p4p -- $fastExe -m $model -f $clip -t 2
+          if ($LASTEXITCODE -eq 0) {
+            throw 'control failed: the FAST engine ran clean under the pre-AVX profile — this proof cannot distinguish the builds; investigate before shipping'
+          }
+          Write-Host 'compat proof passed: compat transcribes on a Pentium-4-class CPU; the fast build provably cannot.'
 
       - name: Rust unit tests (credits, recommendation rules, manifest)
         run: cargo test --manifest-path src-tauri/Cargo.toml
