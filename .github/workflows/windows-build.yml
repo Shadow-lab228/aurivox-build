@@ -165,78 +165,58 @@ jobs:
             $Line | Out-File -FilePath $report -Append -Encoding utf8
           }
           Log "Aurivox engine audit - run ${{ github.run_id }}, sha ${{ github.sha }}, $(Get-Date -Format o)"
-          $objdump = (Get-Command 'llvm-objdump.exe' -ErrorAction SilentlyContinue).Source
-          if (-not $objdump -and (Test-Path 'C:\Program Files\LLVM\bin\llvm-objdump.exe')) {
-            $objdump = 'C:\Program Files\LLVM\bin\llvm-objdump.exe'
-          }
-          if (-not $objdump) {
-            Log 'llvm-objdump not found - the audit cannot run'
-            throw 'llvm-objdump not found — the instruction audit is a release gate (RELEASE_QA.md) and must not be skipped'
-          }
           $sidecarDir = Join-Path $env:GITHUB_WORKSPACE 'src-tauri\binaries'
           $fastExe = Join-Path $sidecarDir 'whisper-cli-x86_64-pc-windows-msvc.exe'
           $compatExe = Join-Path $sidecarDir 'whisper-cli-compat-x86_64-pc-windows-msvc.exe'
           Log "fast:   $fastExe"
           Log "compat: $compatExe"
-          function Count-Vex([string]$Exe) {
-            $count = 0
-            & $objdump -d $Exe | ForEach-Object {
-              if ($_ -match '^\s*[0-9a-f]+:\s+(c4|c5|62)\s') { $count++ }
-            }
-            return $count
+          # Function-range audit (SPEC §19.10): the old gate counted
+          # VEX/EVEX first bytes over a linear disassembly sweep,
+          # which decodes MSVC switch jump-table DATA as phantom
+          # instructions (11 of run #7's 237) and can therefore never
+          # read zero on a correct MSVC binary. The count now comes
+          # from packaging/audit_engines.py: it decodes only at true
+          # function boundaries (.pdata RUNTIME_FUNCTION ranges),
+          # excludes jump tables as data, and reports REAL VEX/EVEX
+          # instructions with their owning-function clusters (the
+          # full output lands in the report artifact below).
+          # Gate: compat REAL == 0 AND fast REAL > 0 -- the fast
+          # control must be non-zero, because a counter that reads
+          # zero on the AVX2 build is broken, not passing.
+          python -m pip install --quiet capstone==5.0.7
+          if ($LASTEXITCODE -ne 0) {
+            throw 'pip install capstone failed — the instruction audit is a release gate (RELEASE_QA.md) and must not be skipped'
           }
-          $fastCount = Count-Vex $fastExe
-          $compatCount = Count-Vex $compatExe
-          Log "VEX/EVEX-prefixed instructions: fast=$fastCount compat=$compatCount"
+          $auditor = Join-Path $env:GITHUB_WORKSPACE 'packaging\audit_engines.py'
+          function Count-RealVex([string]$Exe, [string]$Label) {
+            $out = & python $auditor $Exe
+            $code = $LASTEXITCODE
+            $out | ForEach-Object { Log $_ }
+            if ($code -ne 0) {
+              throw "function-range audit failed to run on the $Label engine (exit $code)"
+            }
+            foreach ($line in $out) {
+              if ($line -match '^REAL_VEX_COUNT=(\d+)$') { return [int]$Matches[1] }
+            }
+            throw "function-range audit produced no REAL_VEX_COUNT for the $Label engine"
+          }
+          $fastCount = Count-RealVex $fastExe 'fast'
+          $compatCount = Count-RealVex $compatExe 'compat'
+          Log "VEX/EVEX instructions at true function boundaries: fast=$fastCount compat=$compatCount"
           $auditProblems = @()
           if ($fastCount -eq 0) {
-            $auditProblems += 'audit invalid: the fast engine shows no VEX instructions — the scan is not seeing the code'
+            $auditProblems += 'audit invalid: the fast engine shows no real VEX instructions — the counter is not seeing the code'
           }
           if ($compatCount -ne 0) {
-            $auditProblems += "compat engine contains $compatCount VEX/EVEX-prefixed instructions — NOT safe for pre-AVX CPUs"
+            $auditProblems += "compat engine contains $compatCount real VEX/EVEX instructions — NOT safe for pre-AVX CPUs"
           }
           if ($auditProblems.Count -gt 0) {
-            # Fail diagnosably (SPEC §19.8): cluster the offending
-            # instructions by the nearest preceding symbol in the
-            # disassembly, so the report names WHERE the VEX code
-            # lives (which library / object / function), not just
-            # how much of it there is.
-            Log '--- compat VEX cluster analysis (nearest preceding symbol) ---'
-            $clusters = @{}
-            $samples = @{}
-            $section = '(unknown section)'
-            $symbol = '(no symbol)'
-            & $objdump -d $compatExe | ForEach-Object {
-              if ($_ -match '^Disassembly of section (\S+):') {
-                $section = $Matches[1]
-              } elseif ($_ -match '^[0-9a-f]+ <(.+)>:') {
-                $symbol = $Matches[1]
-              } elseif ($_ -match '^\s*([0-9a-f]+):\s+(c4|c5|62)\s') {
-                $key = "$section $symbol"
-                if (-not $clusters.ContainsKey($key)) {
-                  $clusters[$key] = 0
-                  $samples[$key] = @()
-                }
-                $clusters[$key] = $clusters[$key] + 1
-                if ($samples[$key].Count -lt 3) {
-                  $samples[$key] += $_.Trim()
-                }
-              }
-            }
-            foreach ($key in ($clusters.Keys | Sort-Object { $clusters[$_] } -Descending)) {
-              Log ("{0,8}  {1}" -f $clusters[$key], $key)
-              foreach ($s in $samples[$key]) {
-                Log "           $s"
-              }
-            }
-            & $objdump -t $compatExe | Out-File -FilePath (Join-Path $reportDir 'compat-symbol-table.txt') -Encoding utf8
-            Log 'full compat symbol table saved as compat-symbol-table.txt in this artifact'
             foreach ($problem in $auditProblems) {
               Log "FAIL: $problem"
             }
             throw ($auditProblems -join '; ')
           }
-          Log 'audit passed: compat contains no VEX/EVEX instructions; fast control is non-zero.'
+          Log 'audit passed: compat contains no real VEX/EVEX instructions; fast control is non-zero.'
 
       # The audit report is evidence, not just a gate: publish it on
       # every run (pass or fail) so a regression can be diagnosed
