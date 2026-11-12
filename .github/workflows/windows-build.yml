@@ -88,7 +88,7 @@ jobs:
       # BEFORE cargo test / tauri build run.
 
       # ffmpeg/ffprobe: pinned BtbN autobuild (tag
-      # autobuild-2026-10-27-18-38), LGPL *static* build of the
+      # autobuild-2026-11-11-12-39), LGPL *static* build of the
       # FFmpeg 8.1 branch. We only decode common formats and encode
       # 16 kHz mono WAV — all LGPL-covered functionality — so the
       # LGPL (not GPL) variant keeps redistribution clean; static
@@ -97,8 +97,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $stem = 'ffmpeg-n8.1.3-24-g92611900bb-win64-lgpl-8.1'
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-27-18-38/$stem.zip"
+          $stem = 'ffmpeg-n8.1.3-35-gf1acb0a266-win64-lgpl-8.1'
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-11-11-12-39/$stem.zip"
           $dest = Join-Path $env:RUNNER_TEMP 'ffmpeg-sidecar'
           New-Item -ItemType Directory -Force $dest | Out-Null
           $zip = Join-Path $dest "$stem.zip"
